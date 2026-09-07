@@ -28,6 +28,27 @@ fi
 
 install -m 755 "$HERE/exp" "$BIN/exp"
 
+# Explicit paths in pueue's config. The static musl build cannot look up the
+# username on hosts with LDAP/NIS accounts, and without a name it cannot even
+# derive its default socket path. Fixed paths sidestep that everywhere.
+CFG="$HOME/.config/pueue/pueue.yml"
+RUN="${XDG_RUNTIME_DIR:-/tmp}"
+if [ ! -f "$CFG" ]; then
+  mkdir -p "$HOME/.config/pueue"
+  cat > "$CFG" <<YML
+shared:
+  pueue_directory: $HOME/.local/share/pueue
+  runtime_directory: $RUN
+  use_unix_socket: true
+  unix_socket_path: $RUN/pueue-$(id -u).sock
+YML
+elif grep -q '^  unix_socket_path: null' "$CFG"; then
+  sed -i.bak \
+    -e "s|^  pueue_directory: null|  pueue_directory: $HOME/.local/share/pueue|" \
+    -e "s|^  runtime_directory: null|  runtime_directory: $RUN|" \
+    -e "s|^  unix_socket_path: null|  unix_socket_path: $RUN/pueue-$(id -u).sock|" "$CFG"
+fi
+
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "NOTE: add $BIN to your PATH" ;; esac
 
 # is-system-running exits non-zero for "degraded" (some unrelated unit failed); that is still a usable instance.
@@ -48,7 +69,9 @@ Restart=on-failure
 WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
+  systemctl --user reset-failed pueued.service 2>/dev/null || true
   systemctl --user enable --now pueued.service
+  systemctl --user restart pueued.service
   echo "pueued running as a systemd user service"
   if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
     echo "NOTE: run 'sudo loginctl enable-linger $USER' so the queue survives logout"
