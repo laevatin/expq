@@ -30,7 +30,10 @@ install -m 755 "$HERE/exp" "$BIN/exp"
 
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "NOTE: add $BIN to your PATH" ;; esac
 
-if command -v systemctl >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1; then
+# is-system-running exits non-zero for "degraded" (some unrelated unit failed); that is still a usable instance.
+user_systemd="$(systemctl --user is-system-running 2>/dev/null || true)"
+case "$user_systemd" in running|degraded) have_user_systemd=1 ;; *) have_user_systemd=0 ;; esac
+if [ "$have_user_systemd" = 1 ]; then
   mkdir -p "$HOME/.config/systemd/user"
   cat > "$HOME/.config/systemd/user/pueued.service" <<UNIT
 [Unit]
@@ -51,7 +54,7 @@ UNIT
     echo "NOTE: run 'sudo loginctl enable-linger $USER' so the queue survives logout"
   fi
 else
-  pueued -d
+  "$BIN/pueued" -d
 fi
 
 sleep 1
