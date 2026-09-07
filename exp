@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""exp - a GPU experiment queue for coding agents, built on pueue.
+
+One pueue group per GPU with parallel=1, so at most one experiment runs on a
+card at a time. Agents submit through `exp` instead of launching directly.
+
+    exp init                      # create gpu0..gpuN + cpu groups, start pueued
+    exp submit -- python train.py # queue on the least-loaded GPU
+    exp submit --gpu 1 --label lr3e-4 -- python train.py --lr 3e-4
+    exp submit --gpu none -- python eval.py      # CPU group
+    exp wait <id>                 # block; exit code = the job's exit code
+    exp status [--json]
+    exp log <id> [--follow]
+    exp kill <id>
+    exp gpus
+    exp clean
+
+Environment:
+    EXP_PUEUE_CONFIG   path to a pueue config (passed as `pueue -c`)
+    EXP_GPUS           override GPU count for init (skips nvidia-smi)
+    EXP_GPU_BUSY_MIB   memory-used threshold to call a GPU busy (default 2000)
+    EXP_RUNS_DIR       default runs directory (default: <cwd>/runs)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CPU_GROUP = "cpu"
+GPU_PREFIX = "gpu"
+
+
+# ----------------------------------------------------------------- pueue ---
+def find_bin(name: str) -> str:
+    """Locate pueue/pueued: PATH first, then next to this script (~/.local/bin)."""
+    found = shutil.which(name)
+    if found:
+        return found
+    sibling = Path(__file__).resolve().parent / name
+    if sibling.exists():
+        return str(sibling)
+    die(f"{name} not found on PATH or next to exp. See install.sh.")
+
+
+def pueue_cmd(*args: str) -> list[str]:
+    cmd = [find_bin("pueue")]
+    cfg = os.environ.get("EXP_PUEUE_CONFIG")
+    if cfg:
+        cmd += ["-c", cfg]
+    return cmd + list(args)
+
+
+def pueue(*args: str, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(pueue_cmd(*args), capture_output=True, text=True, check=check, env=env)
+
+
+def pueue_state() -> dict:
+    try:
+        out = pueue("status", "--json").stdout
+    except subprocess.CalledProcessError as e:
+        die(f"pueue daemon not reachable ({e.stderr.strip()}). Run `exp init`.")
+    return json.loads(out)
+
+
+def ensure_daemon() -> None:
+    if pueue("status", "--json", check=False).returncode == 0:
+        return
+    cmd = [find_bin("pueued"), "-d"]
+    cfg = os.environ.get("EXP_PUEUE_CONFIG")
+    if cfg:
+        cmd += ["-c", cfg]
+    # pueued -d forks; don't hold its stdio or we wait forever.
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(50):
+        if pueue("status", "--json", check=False).returncode == 0:
+            return
+        time.sleep(0.1)
+    die("pueued started but is not answering")
+
+
+def task_state(task: dict) -> tuple[str, int | None]:
+    """Normalise pueue's status enum to (state, exit_code).
+
+    state in: queued, running, paused, stashed, locked, success, failed, killed, other
+    """
+    st = task["status"]
+    if isinstance(st, str):
+        return st.lower(), None
+    key = next(iter(st))
+    if key != "Done":
+        return key.lower(), None
+    result = st["Done"].get("result")
+    if result == "Success":
+        return "success", 0
+    if isinstance(result, dict) and "Failed" in result:
+        return "failed", int(result["Failed"])
+    if result == "Killed":
+        return "killed", 137
+    return "failed", 1
+
+
+def is_active(task: dict) -> bool:
+    return task_state(task)[0] in ("queued", "running", "paused", "locked")
+
+
+# ------------------------------------------------------------------- gpus ---
+def nvidia_query() -> list[dict]:
+    """[{index, name, used_mib, total_mib}] or [] if nvidia-smi is missing."""
+    if not shutil.which("nvidia-smi"):
+        return []
+    r = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return []
+    gpus = []
+    for line in r.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            continue
+        gpus.append({"index": int(parts[0]), "name": parts[1], "used_mib": int(float(parts[2])), "total_mib": int(float(parts[3]))})
+    return gpus
+
+
+def gpu_groups(state: dict) -> list[int]:
+    idx = []
+    for name in state["groups"]:
+        if name.startswith(GPU_PREFIX) and name[len(GPU_PREFIX):].isdigit():
+            idx.append(int(name[len(GPU_PREFIX):]))
+    return sorted(idx)
+
+
+def group_load(state: dict, group: str) -> int:
+    return sum(1 for t in state["tasks"].values() if t["group"] == group and is_active(t))
+
+
+def busy_threshold() -> int:
+    return int(os.environ.get("EXP_GPU_BUSY_MIB", "2000"))
+
+
+def pick_gpu(state: dict, want: str) -> tuple[int, list[str]]:
+    """Return (gpu index, warnings)."""
+    groups = gpu_groups(state)
+    if not groups:
+        die("no gpu groups exist. Run `exp init` first.")
+    warnings: list[str] = []
+    if want != "any":
+        i = int(want)
+        if i not in groups:
+            die(f"gpu{i} is not a known group (have {', '.join(f'gpu{g}' for g in groups)})")
+        return i, warnings
+    smi = {g["index"]: g for g in nvidia_query()}
+    loads = {g: group_load(state, f"{GPU_PREFIX}{g}") for g in groups}
+    # A card with nothing queued but memory in use was taken outside the queue.
+    def foreign(g: int) -> bool:
+        return loads[g] == 0 and g in smi and smi[g]["used_mib"] > busy_threshold()
+    # No concurrency on a card: a foreign process is worse than a queue.
+    ranked = sorted(groups, key=lambda g: (foreign(g), loads[g], g))
+    choice = ranked[0]
+    if foreign(choice):
+        warnings.append(f"gpu{choice} has {smi[choice]['used_mib']} MiB in use by a process outside the queue")
+    return choice, warnings
+
+
+# ---------------------------------------------------------------- helpers ---
+def die(msg: str, code: int = 2) -> None:
+    print(f"exp: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def resolve_id(state: dict, ref: str) -> str:
+    """Accept a pueue task id or a run id / label."""
+    if ref in state["tasks"]:
+        return ref
+    matches = [k for k, t in state["tasks"].items() if t.get("label") == ref]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        die(f"label {ref!r} matches several tasks: {', '.join(matches)}")
+    die(f"no task with id or label {ref!r}")
+
+
+def run_dir_of(task: dict) -> str | None:
+    return task.get("envs", {}).get("EXP_RUN_DIR")
+
+
+def short(cmd: str, n: int = 60) -> str:
+    return cmd if len(cmd) <= n else cmd[: n - 1] + "…"
+
+
+def fmt_dur(task: dict) -> str:
+    st = task["status"]
+    if not isinstance(st, dict):
+        return ""
+    inner = next(iter(st.values()))
+    if not isinstance(inner, dict) or "start" not in inner:
+        return ""
+    start = dt.datetime.fromisoformat(inner["start"])
+    end = dt.datetime.fromisoformat(inner["end"]) if inner.get("end") else dt.datetime.now(start.tzinfo)
+    s = int((end - start).total_seconds())
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m" if s >= 3600 else (f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s")
+
+
+# --------------------------------------------------------------- commands ---
+def cmd_init(a: argparse.Namespace) -> None:
+    ensure_daemon()
+    state = pueue_state()
+    if a.gpus is not None:
+        n = a.gpus
+    elif os.environ.get("EXP_GPUS"):
+        n = int(os.environ["EXP_GPUS"])
+    else:
+        n = len(nvidia_query())
+    if n == 0:
+        print("exp: no GPUs detected (nvidia-smi missing?). Creating only the cpu group; pass --gpus N to override.", file=sys.stderr)
+    wanted = {f"{GPU_PREFIX}{i}": 1 for i in range(n)}
+    wanted[CPU_GROUP] = a.cpu_parallel
+    for name, par in wanted.items():
+        if name in state["groups"]:
+            if state["groups"][name]["parallel_tasks"] != par:
+                pueue("parallel", str(par), "--group", name)
+                print(f"group {name}: parallel set to {par}")
+            else:
+                print(f"group {name}: ok (parallel {par})")
+        else:
+            pueue("group", "add", name, "--parallel", str(par))
+            print(f"group {name}: created (parallel {par})")
+
+
+def cmd_submit(a: argparse.Namespace) -> None:
+    if not a.command:
+        die("nothing to run. Usage: exp submit [options] -- <command...>")
+    state = pueue_state()
+    warnings: list[str] = []
+    if a.gpu == "none":
+        group, gpu = CPU_GROUP, None
+        if group not in state["groups"]:
+            die("cpu group missing. Run `exp init`.")
+    else:
+        gpu, warnings = pick_gpu(state, a.gpu)
+        group = f"{GPU_PREFIX}{gpu}"
+
+    cwd = Path(a.cwd or os.getcwd()).resolve()
+    label_part = ("-" + "".join(c if c.isalnum() or c in "-_." else "_" for c in a.label)) if a.label else ""
+    run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + label_part + "-" + secrets.token_hex(2)
+    runs_root = Path(a.runs_dir or os.environ.get("EXP_RUNS_DIR") or cwd / "runs")
+    run_dir = (runs_root / run_id).resolve()
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    command = a.command[0] if len(a.command) == 1 else shlex.join(a.command)
+
+    env = dict(os.environ)
+    env["EXP_RUN_ID"] = run_id
+    env["EXP_RUN_DIR"] = str(run_dir)
+    env["EXP_GROUP"] = group
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env["EXP_GPU"] = str(gpu)
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+
+    args = ["add", "--group", group, "--label", run_id, "--working-directory", str(cwd), "--print-task-id"]
+    if a.after:
+        args += ["--after", *a.after]
+    args += ["--", command]
+    r = pueue(*args, env=env)
+    task_id = r.stdout.strip().splitlines()[-1]
+
+    meta = {
+        "task_id": int(task_id), "run_id": run_id, "group": group, "gpu": gpu, "command": command,
+        "cwd": str(cwd), "run_dir": str(run_dir), "submitted_at": dt.datetime.now().astimezone().isoformat(),
+        "label": a.label, "warnings": warnings,
+    }
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    for w in warnings:
+        print(f"exp: warning: {w}", file=sys.stderr)
+    if a.json:
+        print(json.dumps(meta))
+    else:
+        where = f"gpu{gpu}" if gpu is not None else "cpu"
+        print(f"task {task_id}  {run_id}  → {where}  ({group_load(state, group)} ahead)\n  run_dir: {run_dir}")
+
+
+def cmd_wait(a: argparse.Namespace) -> None:
+    state = pueue_state()
+    ids = [resolve_id(state, r) for r in a.ids]
+    pueue("wait", *ids, check=False)
+    state = pueue_state()
+    worst = 0
+    for tid in ids:
+        task = state["tasks"][tid]
+        st, code = task_state(task)
+        code = 0 if code is None else code
+        worst = max(worst, code)
+        rd = run_dir_of(task)
+        if rd and Path(rd).is_dir():
+            try:
+                log = pueue("log", tid, "--json").stdout
+                out = json.loads(log)[tid].get("output", "")
+                Path(rd, "log.txt").write_text(out)
+                meta_p = Path(rd, "meta.json")
+                meta = json.loads(meta_p.read_text()) if meta_p.exists() else {}
+                meta.update({"state": st, "exit_code": code, "finished_at": dt.datetime.now().astimezone().isoformat()})
+                meta_p.write_text(json.dumps(meta, indent=2) + "\n")
+            except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError):
+                pass
+        print(f"task {tid}  {task.get('label') or ''}  {st}  exit={code}  {fmt_dur(task)}")
+    sys.exit(worst)
+
+
+def cmd_status(a: argparse.Namespace) -> None:
+    state = pueue_state()
+    rows = []
+    for tid, t in sorted(state["tasks"].items(), key=lambda kv: int(kv[0])):
+        st, code = task_state(t)
+        if a.active and not is_active(t):
+            continue
+        rows.append({
+            "id": int(tid), "run_id": t.get("label"), "group": t["group"], "state": st, "exit_code": code,
+            "gpu": t.get("envs", {}).get("EXP_GPU"), "duration": fmt_dur(t), "command": t["command"],
+            "run_dir": run_dir_of(t), "cwd": t["path"],
+        })
+    if a.json:
+        print(json.dumps({"tasks": rows, "groups": {g: v["parallel_tasks"] for g, v in state["groups"].items()}}))
+        return
+    if not rows:
+        print("no tasks")
+        return
+    print(f"{'id':>4} {'group':<6} {'state':<8} {'time':>7}  {'run_id':<34} command")
+    for r in rows:
+        print(f"{r['id']:>4} {r['group']:<6} {r['state']:<8} {r['duration']:>7}  {(r['run_id'] or ''):<34} {short(r['command'])}")
+
+
+def cmd_log(a: argparse.Namespace) -> None:
+    state = pueue_state()
+    tid = resolve_id(state, a.id)
+    if a.follow:
+        argv = pueue_cmd("follow", tid)
+        os.execv(argv[0], argv)
+    r = pueue("log", tid, "--json", check=False)
+    if r.returncode != 0:
+        die(r.stderr.strip())
+    entry = json.loads(r.stdout)[tid]
+    out = entry.get("output", "")
+    if a.tail:
+        out = "\n".join(out.splitlines()[-a.tail:])
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+
+
+def cmd_kill(a: argparse.Namespace) -> None:
+    state = pueue_state()
+    for ref in a.ids:
+        tid = resolve_id(state, ref)
+        st, _ = task_state(state["tasks"][tid])
+        if st == "running":
+            pueue("kill", tid)
+            print(f"task {tid}: killed")
+        elif st in ("queued", "paused", "stashed", "locked"):
+            pueue("remove", tid)
+            print(f"task {tid}: removed from queue")
+        else:
+            print(f"task {tid}: already {st}")
+
+
+def cmd_gpus(a: argparse.Namespace) -> None:
+    state = pueue_state()
+    smi = {g["index"]: g for g in nvidia_query()}
+    running = {}
+    for tid, t in state["tasks"].items():
+        if task_state(t)[0] == "running":
+            running[t["group"]] = f"task {tid} {t.get('label') or ''}".strip()
+    for g in gpu_groups(state):
+        name = f"{GPU_PREFIX}{g}"
+        q = group_load(state, name)
+        mem = f"{smi[g]['used_mib']}/{smi[g]['total_mib']} MiB  {smi[g]['name']}" if g in smi else "nvidia-smi n/a"
+        who = running.get(name, "idle")
+        flag = "  ⚠ in use outside the queue" if name not in running and g in smi and smi[g]["used_mib"] > busy_threshold() else ""
+        print(f"{name}: {who:<40} active={q}  {mem}{flag}")
+    if CPU_GROUP in state["groups"]:
+        print(f"{CPU_GROUP}: parallel={state['groups'][CPU_GROUP]['parallel_tasks']} active={group_load(state, CPU_GROUP)}")
+
+
+def cmd_clean(a: argparse.Namespace) -> None:
+    pueue("clean")
+    print("finished tasks removed from pueue (run dirs are kept)")
+
+
+# ------------------------------------------------------------------- main ---
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(prog="exp", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="create per-GPU groups and start the daemon")
+    s.add_argument("--gpus", type=int, help="number of GPUs (default: nvidia-smi)")
+    s.add_argument("--cpu-parallel", type=int, default=4)
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("submit", help="queue a command on a GPU")
+    s.add_argument("--gpu", default="any", help="any | <index> | none (cpu group)")
+    s.add_argument("--label", help="short name folded into the run id")
+    s.add_argument("--cwd", help="working directory (default: current)")
+    s.add_argument("--runs-dir", help="where run dirs go (default: <cwd>/runs)")
+    s.add_argument("--after", nargs="*", metavar="ID", help="only start after these task ids finish")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_submit)
+
+    s = sub.add_parser("wait", help="block until tasks finish; exit code = worst exit code")
+    s.add_argument("ids", nargs="+")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("status", help="list tasks")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--active", action="store_true", help="only queued/running")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("log", help="show a task's output")
+    s.add_argument("id")
+    s.add_argument("-f", "--follow", action="store_true")
+    s.add_argument("-n", "--tail", type=int)
+    s.set_defaults(fn=cmd_log)
+
+    s = sub.add_parser("kill", help="kill a running task or drop a queued one")
+    s.add_argument("ids", nargs="+")
+    s.set_defaults(fn=cmd_kill)
+
+    s = sub.add_parser("gpus", help="per-GPU view: who is running, queue depth, memory")
+    s.set_defaults(fn=cmd_gpus)
+
+    s = sub.add_parser("clean", help="drop finished tasks from pueue's list")
+    s.set_defaults(fn=cmd_clean)
+
+    a = p.parse_args(argv)
+    if a.cmd == "submit" and a.command and a.command[0] == "--":
+        a.command = a.command[1:]
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

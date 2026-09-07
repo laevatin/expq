@@ -1,0 +1,21 @@
+# GPU experiments go through the queue
+
+This machine's GPUs are shared by several agents. Never launch training,
+fine-tuning, or any CUDA workload directly. Always use `exp`:
+
+    exp submit --label <short-name> -- <command>      # returns a task id
+    exp wait <id>                                     # blocks; exit code is the job's
+    exp log <id> [-n 50]                              # output so far
+    exp status --active                               # what is queued/running
+    exp gpus                                          # per-GPU view
+    exp kill <id>                                     # abandon a run
+
+Rules:
+- One run per GPU. `exp submit` picks the least-loaded card and sets
+  CUDA_VISIBLE_DEVICES for you. Do not set it yourself.
+- Write all outputs (checkpoints, metrics, plots) under `$EXP_RUN_DIR`.
+  It is a fresh directory per run; `meta.json` and `log.txt` land there.
+- Quick CPU-only checks (unit tests, data prep, evals under a minute) can run
+  directly. Anything longer goes through `exp submit --gpu none`.
+- Do not `exp kill` a task you did not submit.
+- Work in your own git worktree so file edits do not collide with other agents.
