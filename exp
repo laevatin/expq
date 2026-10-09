@@ -9,11 +9,11 @@ card at a time. Agents submit through `exp` instead of launching directly.
     exp submit --gpu 1 --label lr3e-4 -- python train.py --lr 3e-4
     exp submit --gpu none -- python eval.py      # CPU group
     exp wait <id>                 # block; exit code = the job's exit code
-    exp status [--json]
+    exp status [--active | --all | -n N] [--json]
     exp log <id> [--follow]
     exp kill <id>
     exp gpus
-    exp clean
+    exp clean [--older-than HOURS]
 
 Environment:
     EXP_PUEUE_CONFIG   path to a pueue config (passed as `pueue -c`)
@@ -211,6 +211,41 @@ def fmt_dur(task: dict) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m" if s >= 3600 else (f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s")
 
 
+def end_time(task: dict) -> dt.datetime | None:
+    st = task["status"]
+    if isinstance(st, dict) and "Done" in st and st["Done"].get("end"):
+        return dt.datetime.fromisoformat(st["Done"]["end"])
+    return None
+
+
+def task_outputs(ids: list[str]) -> dict[str, str]:
+    """{id: output} for several tasks in one pueue call."""
+    r = pueue("log", *ids, "--json", check=False)
+    try:
+        return {k: v.get("output") or "" for k, v in json.loads(r.stdout).items()}
+    except json.JSONDecodeError:
+        return {}
+
+
+def archive(tid: str, task: dict, output: str | None = None) -> None:
+    """Copy a finished task's output and final state into its run dir (pueue drops them on removal)."""
+    rd = run_dir_of(task)
+    if not rd or not Path(rd).is_dir():
+        return
+    st, code = task_state(task)
+    code = 0 if code is None else code
+    try:
+        out = task_outputs([tid]).get(tid, "") if output is None else output
+        Path(rd, "log.txt").write_text(out)
+        meta_p = Path(rd, "meta.json")
+        meta = json.loads(meta_p.read_text()) if meta_p.exists() else {}
+        end = end_time(task) or dt.datetime.now().astimezone()
+        meta.update({"state": st, "exit_code": code, "finished_at": end.isoformat()})
+        meta_p.write_text(json.dumps(meta, indent=2) + "\n")
+    except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError, OSError):
+        pass
+
+
 # --------------------------------------------------------------- commands ---
 def cmd_init(a: argparse.Namespace) -> None:
     ensure_daemon()
@@ -302,28 +337,22 @@ def cmd_wait(a: argparse.Namespace) -> None:
         st, code = task_state(task)
         code = 0 if code is None else code
         worst = max(worst, code)
-        rd = run_dir_of(task)
-        if rd and Path(rd).is_dir():
-            try:
-                log = pueue("log", tid, "--json").stdout
-                out = json.loads(log)[tid].get("output", "")
-                Path(rd, "log.txt").write_text(out)
-                meta_p = Path(rd, "meta.json")
-                meta = json.loads(meta_p.read_text()) if meta_p.exists() else {}
-                meta.update({"state": st, "exit_code": code, "finished_at": dt.datetime.now().astimezone().isoformat()})
-                meta_p.write_text(json.dumps(meta, indent=2) + "\n")
-            except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError):
-                pass
+        archive(tid, task)
         print(f"task {tid}  {task.get('label') or ''}  {st}  exit={code}  {fmt_dur(task)}")
     sys.exit(worst)
 
 
 def cmd_status(a: argparse.Namespace) -> None:
     state = pueue_state()
+    tasks = sorted(state["tasks"].items(), key=lambda kv: int(kv[0]))
+    # Finished tasks pile up until `exp clean`; show only the most recent ones by default.
+    done = [tid for tid, t in tasks if task_state(t)[0] in ("success", "failed", "killed")]
+    keep = 0 if a.active else len(done) if a.all else max(a.recent, 0)
+    hidden = set(done[: len(done) - keep])
     rows = []
-    for tid, t in sorted(state["tasks"].items(), key=lambda kv: int(kv[0])):
+    for tid, t in tasks:
         st, code = task_state(t)
-        if a.active and not is_active(t):
+        if tid in hidden or (a.active and not is_active(t)):
             continue
         rows.append({
             "id": int(tid), "run_id": t.get("label"), "group": t["group"], "state": st, "exit_code": code,
@@ -331,14 +360,17 @@ def cmd_status(a: argparse.Namespace) -> None:
             "run_dir": run_dir_of(t), "cwd": t["path"],
         })
     if a.json:
-        print(json.dumps({"tasks": rows, "groups": {g: v["parallel_tasks"] for g, v in state["groups"].items()}}))
+        groups = {g: v["parallel_tasks"] for g, v in state["groups"].items()}
+        print(json.dumps({"tasks": rows, "hidden": len(hidden), "groups": groups}))
         return
-    if not rows:
+    if rows:
+        print(f"{'id':>4} {'group':<6} {'state':<8} {'time':>7}  {'run_id':<34} command")
+        for r in rows:
+            print(f"{r['id']:>4} {r['group']:<6} {r['state']:<8} {r['duration']:>7}  {(r['run_id'] or ''):<34} {short(r['command'])}")
+    else:
         print("no tasks")
-        return
-    print(f"{'id':>4} {'group':<6} {'state':<8} {'time':>7}  {'run_id':<34} command")
-    for r in rows:
-        print(f"{r['id']:>4} {r['group']:<6} {r['state']:<8} {r['duration']:>7}  {(r['run_id'] or ''):<34} {short(r['command'])}")
+    if hidden and not a.active:
+        print(f"({len(hidden)} older finished tasks hidden; --all to show them, `exp clean` to drop them)")
 
 
 def cmd_log(a: argparse.Namespace) -> None:
@@ -391,8 +423,27 @@ def cmd_gpus(a: argparse.Namespace) -> None:
 
 
 def cmd_clean(a: argparse.Namespace) -> None:
-    pueue("clean")
-    print("finished tasks removed from pueue (run dirs are kept)")
+    state = pueue_state()
+    cutoff = dt.datetime.now().astimezone() - dt.timedelta(hours=a.older_than) if a.older_than else None
+    ids = []
+    for tid, t in sorted(state["tasks"].items(), key=lambda kv: int(kv[0])):
+        end = end_time(t)
+        if end is None or task_state(t)[0] not in ("success", "failed", "killed"):
+            continue
+        if cutoff and end > cutoff:
+            continue
+        ids.append(tid)
+    # Chunked so an interrupted run still makes progress; one `pueue log` call per chunk.
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        todo = [tid for tid in chunk
+                if run_dir_of(state["tasks"][tid]) and not Path(run_dir_of(state["tasks"][tid]), "log.txt").exists()]
+        outputs = task_outputs(todo) if todo else {}
+        for tid in todo:
+            archive(tid, state["tasks"][tid], outputs.get(tid, ""))
+        pueue("remove", *chunk)
+    window = f" finished more than {a.older_than:g}h ago" if cutoff else ""
+    print(f"{len(ids)} tasks{window} removed from pueue (logs saved to run dirs, which are kept)")
 
 
 # ------------------------------------------------------------------- main ---
@@ -422,6 +473,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("status", help="list tasks")
     s.add_argument("--json", action="store_true")
     s.add_argument("--active", action="store_true", help="only queued/running")
+    s.add_argument("--all", action="store_true", help="include every finished task")
+    s.add_argument("-n", "--recent", type=int, default=10, help="finished tasks to show (default 10)")
     s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("log", help="show a task's output")
@@ -438,6 +491,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_gpus)
 
     s = sub.add_parser("clean", help="drop finished tasks from pueue's list")
+    s.add_argument("--older-than", type=float, metavar="HOURS", help="only tasks that finished more than HOURS ago")
     s.set_defaults(fn=cmd_clean)
 
     a = p.parse_args(argv)

@@ -187,3 +187,31 @@ def test_clean_keeps_run_dirs(daemon, work):
     exp(env, "clean")
     assert Path(m["run_dir"]).is_dir()
     assert m["task_id"] not in {t["id"] for t in json.loads(exp(env, "status", "--json").stdout)["tasks"]}
+
+
+def test_clean_older_than_keeps_recent_and_saves_logs(daemon, work):
+    d, env = daemon
+
+    def state_of(tid):
+        tasks = json.loads(exp(env, "status", "--json", "--all").stdout)["tasks"]
+        return next((t["state"] for t in tasks if t["id"] == tid), None)
+
+    old = submit(env, "--", "echo", "old-output", cwd=work)
+    # never waited on: clean itself must archive the log before removing the task
+    while state_of(old["task_id"]) != "success":
+        time.sleep(0.1)
+    time.sleep(5)
+    new = submit(env, "--", "true", cwd=work)
+    exp(env, "wait", str(new["task_id"]))
+    out = exp(env, "clean", "--older-than", str(3 / 3600)).stdout  # 3 second window
+    assert state_of(old["task_id"]) is None and state_of(new["task_id"]) == "success", out
+    assert Path(old["run_dir"], "log.txt").read_text().strip() == "old-output"
+
+
+def test_status_hides_old_finished_tasks(daemon, work):
+    d, env = daemon
+    for _ in range(3):
+        exp(env, "wait", str(submit(env, "--", "true", cwd=work)["task_id"]))
+    st = json.loads(exp(env, "status", "--json", "-n", "1").stdout)
+    assert sum(t["state"] == "success" for t in st["tasks"]) == 1 and st["hidden"] >= 2
+    assert "older finished tasks hidden" in exp(env, "status", "-n", "1").stdout

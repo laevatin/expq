@@ -68,16 +68,46 @@ Restart=on-failure
 [Install]
 WantedBy=default.target
 UNIT
+  # Sliding 24h window over finished tasks: hourly, drop anything that finished >24h ago.
+  cat > "$HOME/.config/systemd/user/exp-clean.service" <<UNIT
+[Unit]
+Description=exp: drop tasks finished more than 24h ago
+After=pueued.service
+
+[Service]
+Type=oneshot
+ExecStart=$BIN/exp clean --older-than 24
+UNIT
+  cat > "$HOME/.config/systemd/user/exp-clean.timer" <<UNIT
+[Unit]
+Description=exp: hourly sliding-window clean
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
   systemctl --user daemon-reload
   systemctl --user reset-failed pueued.service 2>/dev/null || true
   systemctl --user enable --now pueued.service
   systemctl --user restart pueued.service
-  echo "pueued running as a systemd user service"
+  systemctl --user enable --now exp-clean.timer
+  echo "pueued running as a systemd user service; exp-clean.timer prunes finished tasks hourly"
   if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
     echo "NOTE: run 'sudo loginctl enable-linger $USER' so the queue survives logout"
   fi
 else
   "$BIN/pueued" -d
+  # No user systemd: same hourly sliding-window clean via cron, if available.
+  line="0 * * * * $BIN/exp clean --older-than 24 >/dev/null 2>&1"
+  if command -v crontab >/dev/null 2>&1; then
+    { crontab -l 2>/dev/null | grep -v 'exp clean --older-than' || true; echo "$line"; } | crontab -
+    echo "cron entry added: hourly exp clean --older-than 24"
+  else
+    echo "NOTE: no systemd or cron; run 'exp clean --older-than 24' periodically"
+  fi
 fi
 
 sleep 1

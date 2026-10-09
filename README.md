@@ -26,7 +26,7 @@ onto your PATH and run `exp init --gpus 0`.
 
     exp wait 7            # blocks; exits with the job's exit code
     exp log 7 -n 50       # or: exp log 7 -f
-    exp status --active   # or --json
+    exp status            # active + last 10 finished; --active, --all, -n N, --json
     exp gpus              # who is on which card, queue depth, memory
     exp kill 7
     exp submit --gpu none -- python eval.py     # cpu group, parallel 4
@@ -35,6 +35,12 @@ onto your PATH and run `exp init --gpus 0`.
 Inside a job these are set: `CUDA_VISIBLE_DEVICES` (one card),
 `EXP_GPU`, `EXP_RUN_ID`, `EXP_RUN_DIR` (fresh directory, holds `meta.json`
 and, after `exp wait`, `log.txt`).
+
+Finished tasks are pruned on a sliding 24h window: `install.sh` sets up an
+hourly `exp clean --older-than 24` (systemd user timer, or cron). A task's
+output is copied to `log.txt` in its run dir before it is dropped, so
+`runs/<id>/` stays the long-term record. `exp clean` with no flag drops every
+finished task now.
 
 `exp submit --gpu any` (the default) picks the GPU with the shortest queue.
 A card whose memory is in use by something outside the queue is avoided;
